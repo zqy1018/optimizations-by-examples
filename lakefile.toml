@@ -1,0 +1,19 @@
+name = "ExpOpt"
+version = "0.1.0"
+defaultTargets = ["ExpOpt"]
+
+[[lean_lib]]
+name = "ExpOpt"
+# Every module under ExpOpt/ is an independent example with its own `main`, so the library is
+# the set of them rather than one root that imports them all.
+globs = ["ExpOpt.*"]
+
+# One executable per example, for the benchmark at the end of each file.
+
+[[lean_exe]]
+name = "quantifier-loops"
+root = "ExpOpt.QuantifierLoops"
+
+[[lean_exe]]
+name = "scalar-fingerprints"
+root = "ExpOpt.ScalarFingerprints"
