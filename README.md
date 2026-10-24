@@ -8,5 +8,5 @@ infoview shows a definition's IR under a `[Compiler.IR] [result]` node. Most fil
 
 | File | How | Effect |
 |---|---|---|
-| [QuantifierLoops.lean](ExpOpt/QuantifierLoops.lean) | Decide `∀ i : Fin n, P i` with an `@[macro_inline]` instance over a `@[specialize]` loop, instead of core's instance, which calls `P` through a closure. `@[inline]` or `@[specialize]` on an instance does nothing. | 8–9× faster per quantifier (`lake exe quantifier-loops`) |
 | [ScalarFingerprints.lean](ExpOpt/ScalarFingerprints.lean) | Store a hash as a `Nat` below 2⁶³, a tagged scalar, instead of a `UInt64`, which polymorphic containers box into a 16-byte object. Drop the top bit, not the bottom one. | 1.5× faster inserts, 1.2× faster lookups, 40 MB less for 4M keys (`lake exe scalar-fingerprints`) |
+| [QuantifierLoops.lean](ExpOpt/QuantifierLoops.lean) | Decide `∀ i : Fin n, P i` with an `@[macro_inline]` instance over a `@[specialize]` loop, because core's instance called `P` through a closure and no attribute on a `Decidable` instance helped: `Decidable` was a `class inductive`. From Lean v4.35 it is a structure and the compiler specializes the core instance itself. | 8–9× faster per quantifier on v4.32 (`lake exe quantifier-loops`); obsolete from v4.35 |

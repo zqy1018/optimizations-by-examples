@@ -1,52 +1,63 @@
 /-!
-# Bounded quantifiers, decided by a loop of their own
+# An optimization with a shelf life
 
-Veil: PR #87.
+Veil: PR #87. A workaround measured on Lean v4.32 and v4.34, revisited on v4.35.
 
-## Why it matters
+## Why it mattered
 
-A bounded quantifier such as `∀ i : Fin n, P i` is decided by a `Decidable` instance, and an
-instance is an ordinary function: compiled once, for an arbitrary `P`. Each call site hands over
-its predicate as a closure, and the loop inside the instance calls the closure back once per
-candidate. When `P i` itself is cheap, an array read and a comparison, the callback is most of the
-work: an indirect call, reference-count traffic on the captured variables, boxing of the result.
-Code that decides many such quantifiers in a hot loop, as a model checker does for the invariants
-and guards of every state it explores, pays this on every candidate of every quantifier.
+Invariants and guards of a specification are full of bounded quantifiers, `∀ i : Fin n, P i`, and
+a model checker decides them on every state it explores, through the `Decidable` instances Lean
+synthesizes. Instance search happens during elaboration; at run time, the selected instance
+executes the check. The proposition and its proofs are erased, but the decision procedure supplied
+by `DecidablePred P` still has to run. Below, "predicate closure" means this executable check.
 
-## The lesson
+On older toolchains, calling the predicate for each element dominated the array check below;
+specialization put the check directly into the loop.
 
-The obvious tools do not help. The compiler does not inline instances in the phase where it
-specializes, and it never specializes instances at all, so `@[inline]` or `@[specialize]` on the
-instance leave its loop blind to the predicate. `@[macro_inline]` works, because it expands the
-instance before compilation proper begins: the call site then sees a `@[specialize]` loop applied
-to its predicate, and gets a copy of the loop with the predicate compiled in.
+## Why revisit it
+
+On Lean v4.35, the same source expression already produces a specialized core loop.
 -/
 
-/-! ## 1. The naive version, and what it compiles to
+/-! ## 1. The naive version, and what it compiled to on v4.32
 
 Is every element of an array below a bound? As a quantifier over `Fin`, with the instance Lean
-finds on its own, `Nat.decidableForallFin` from core. Its IR is in the infoview, under a
-`[Compiler.IR] [result]` node, or in the `lake build` output. The two lines that matter:
+finds on its own, `Nat.decidableForallFin` from core. On v4.32 its IR (infoview, under a
+`[Compiler.IR] [result]` node, or in the `lake build` output) has two lines that matter. Here `pap`
+constructs a closure containing the check and its captured arguments:
 
     let x_3 : obj := pap allBelowCore._lam_0._boxed x_1 x_2;   -- a closure: the predicate
     let x_5 : u8 := Nat.decidableForallFin._redArg x_4 x_3;    -- core's instance, precompiled
 
-The predicate `fun i => xs[i] < bound` became `allBelowCore._lam_0`, which the `pap` wraps in a
-closure together with `xs` and `bound`. Core's instance reduces to `Nat.decidableBallLT`, which a
-`@[csimp]` lemma replaces at run time by `Nat.decidableBallLTTR`, whose loop was compiled once, in
-`Init.Data.Nat.Lemmas`, for an arbitrary `f`. So for every `i` the loop calls our closure through
-`lean_apply_1`: an indirect call that bumps the reference counts of the captured `xs` and `bound`,
-enters the `_boxed` wrapper, and boxes the `Bool` on the way back. -/
+The predicate `fun i => xs[i] < bound` became `allBelowCore._lam_0`, wrapped in a closure with `xs`
+and `bound`. Core's instance reduces to `Nat.decidableBallLT`, which a `@[csimp]` lemma replaces
+during compilation by `Nat.decidableBallLTTR`, whose loop was compiled in `Init.Data.Nat.Lemmas`
+for an arbitrary `f`; for each visited `i` it calls our closure through `lean_apply_1`. The closure
+is allocated once per quantifier call; the indirect call and its ownership bookkeeping recur per
+element. The `Bool` result is boxed as a tagged immediate, without a heap allocation. Small `Nat`
+captures such as this benchmark's bound also have no reference count, whereas the array does. -/
 
 set_option trace.compiler.ir.result true in
 def allBelowCore (xs : Array Nat) (bound : Nat) : Bool :=
   decide (∀ i : Fin xs.size, xs[i] < bound)
 
-/-! ## 2. The loop we want, and two attributes that do not get us there
+/-! ## 2. The loop we want, and the attribute that did not get us there
 
-`allLT n f` checks `f 0, f 1, …` and stops at the first `false`. It is the loop core uses, with
-one difference that matters: `go` is `@[specialize]`, so the compiler is allowed to make a copy of
-it for each `f` it is called with. -/
+`allLT n f` checks `f 0, f 1, …` and stops at the first `false`; `go` is `@[specialize]`, so the
+compiler may copy it for a visible predicate. Core's `Nat.allLTTR.loop` already had this attribute;
+the missing opportunity was exposing the predicate to it. This version keeps the current index
+and remaining count explicitly, while core computes the index from its remaining count.
+
+With `@[inline]` on an instance built from this loop, the IR of
+`allBelow` on v4.32 still built the predicate closure, a second closure around it, and called the
+*generic* `Loop.allLT.go._redArg`: `allLT` was inlined, being a plain definition, but too late for
+`go` to be specialized. The compiler's inliner says why
+(`Lean/Compiler/LCNF/Simp/InlineCandidate.lean`): "We don't inline instances tagged with
+`[inline]/[always_inline]/[inline_if_reduce]` at the base phase", and the base phase is where
+specialization happens. In this compiler, `@[specialize]` on the instance did no better:
+`Lean/Compiler/LCNF/Specialize.lean` skips declarations with `implicitReducible` status, which the
+`instance` command assigns by default. These are compiler policies, not semantic properties of
+type classes. -/
 
 namespace Loop
 
@@ -59,6 +70,7 @@ where
     | 0, _ => true
     | k + 1, h => f i (by omega) && go (i + 1) k (by omega)
 
+-- The next three lemmas establish correctness; they can be skipped when following the optimization.
 private theorem allLT_go_eq_true {n : Nat} {f : (i : Nat) → i < n → Bool} :
     ∀ k i (h : i + k = n), allLT.go n f i k h = true ↔ ∀ j (hj : j < n), i ≤ j → f j hj = true := by
   intro k; induction k <;> (intro i h; simp only [allLT.go]; grind)
@@ -75,21 +87,6 @@ theorem forall_fin_iff_allLT {n : Nat} (P : Fin n → Prop) [DecidablePred P] :
 
 end Loop
 
-/-! ### Attempt A: `@[inline]` on the instance
-
-The IR of `allBelow` below still builds the predicate closure, then a second closure around it,
-and calls the *generic* `Loop.allLT.go._redArg`: `allLT` was inlined (it is a plain definition),
-but by then it was too late for `go` to be specialized.
-
-    let x_3 : obj := pap allBelowCore._lam_0._boxed x_1 x_2;   -- the same lambda as before, reused
-    let x_5 : obj := pap WithInlineInstance.decForallFin._redArg._lam_0._boxed x_3;
-    let x_7 : u8 := Loop.allLT.go._redArg x_5 x_6 x_4;
-
-The reason is in the compiler's inliner (`Lean/Compiler/LCNF/Simp/InlineCandidate.lean`): "We
-don't inline instances tagged with `[inline]/[always_inline]/[inline_if_reduce]` at the base
-phase." The base phase is where specialization happens; by the time the instance is inlined, in
-the mono phase, the specializer has run. `@[always_inline]` behaves the same. -/
-
 namespace WithInlineInstance
 
 @[inline] scoped instance (priority := high) decForallFin {n : Nat} (P : Fin n → Prop)
@@ -102,44 +99,18 @@ def allBelow (xs : Array Nat) (bound : Nat) : Bool :=
 
 end WithInlineInstance
 
-/-! ### Attempt B: `@[specialize]` on the instance
-
-Now the instance is called as a function, with the closure, and nothing is specialized:
-
-    let x_3 : obj := pap allBelowCore._lam_0._boxed x_1 x_2;
-    let x_5 : u8 := WithSpecializeInstance.decForallFin._redArg x_4 x_3;
-
-The specializer (`Lean/Compiler/LCNF/Specialize.lean`, `specializeApp?`) returns early for every
-declaration whose reducibility status is `implicitReducible`, which is the status every `instance`
-gets (`Lean.getReducibilityStatus` shows it). -/
-
-namespace WithSpecializeInstance
-
-@[specialize] scoped instance (priority := high) decForallFin {n : Nat} (P : Fin n → Prop)
-    [DecidablePred P] : Decidable (∀ i, P i) :=
-  decidable_of_iff _ (Loop.forall_fin_iff_allLT P)
-
-set_option trace.compiler.ir.result true in
-def allBelow (xs : Array Nat) (bound : Nat) : Bool :=
-  decide (∀ i : Fin xs.size, xs[i] < bound)
-
-end WithSpecializeInstance
-
 /-! ## 3. The fix: `@[macro_inline]` on the instance
 
 `@[macro_inline]` is not an inlining hint for the optimizer; it is a substitution performed when
-the definition is first translated for the compiler (`Lean/Compiler/LCNF/ToDecl.lean`,
-`macroInline`), before any compiler pass. Core uses it for `Decidable (p ∧ q)` and `(p → q)`, so
-that `if p ∧ q then …` short-circuits. After the expansion, the compiler sees
-`Loop.allLT n (fun i h => decide (xs[i] < bound))` right in `allBelow`, and the specializer gives
-`go` a copy for this predicate: `Loop.allLT.go._at_.allBelow.spec_0` below reads the array and
-compares, with no closure in sight.
-
-Two things to know about `@[macro_inline]`: it is a macro, so an argument that the body uses twice
-is evaluated twice (our body uses `n`, `P` and the instance once each); and it is only allowed on
-non-recursive definitions, which is why the loop is a separate `@[specialize]` function.
-
-The priority is `high` so that this instance beats core's for the same type. -/
+the definition is first translated for the compiler (`Lean/Compiler/LCNF/ToDecl.lean`), before any
+pass. Core uses it for `Decidable (p ∧ q)`, so that `if p ∧ q then …` short-circuits. After the
+expansion the compiler sees `Loop.allLT n (fun i h => decide (xs[i] < bound))` right in
+`allBelow`, and the specializer gives `go` a copy for this predicate:
+`Loop.allLT.go._at_.allBelow.spec_0` reads the array and compares, with no predicate closure.
+The values of `xs` and `bound` can still vary at run time; it is the code of the check that must be
+visible. Substituting argument expressions can duplicate work if the body uses them more than
+once. `@[macro_inline]` is only allowed on non-recursive definitions, which is why the loop is a
+separate function. -/
 
 @[macro_inline] instance (priority := high) decidableForallFin {n : Nat} (P : Fin n → Prop)
     [DecidablePred P] : Decidable (∀ i, P i) :=
@@ -151,25 +122,36 @@ def allBelow (xs : Array Nat) (bound : Nat) : Bool :=
 
 /-! ## 4. Nothing changed but the code
 
-Two instances of `Decidable p` are equal (there is only one proof of `p`, and only one of `¬p`), so
-the two functions agree: -/
+Two instances of `Decidable p` are equal, so the two functions agree, and the new instance still
+evaluates in the kernel. This establishes their semantic agreement; their relative execution
+cost is a separate measurement. The `by decide` example checks kernel evaluation still works,
+without making a claim about its speed. -/
 
 theorem allBelow_eq_allBelowCore (xs : Array Nat) (bound : Nat) :
     allBelow xs bound = allBelowCore xs bound := by
   unfold allBelow allBelowCore
   congr   -- `Decidable (∀ i, …)` is a `Subsingleton`
 
-/-- The new instance still evaluates inside the kernel, so `by decide` keeps working. -/
 example : ∀ i : Fin 3, #[1, 2, 3][i] < 4 := by decide
 
 /-! ## 5. Measure it
 
 `lake exe quantifier-loops [n] [iters]` decides the quantifier `iters` times over an array of `n`
-elements, with each version; the bound changes with the iteration so that nothing can be hoisted
-out of the loop. With the defaults (64 elements, 1,000,000 calls each) the core instance takes
-490–620 ns per call and the specialized loop 55–70 ns, a factor of 8–9 (Apple M4 Pro). What the
-specialized loop does not pay is the per-element callback: the closure call, the reference-count
-traffic, the boxing. -/
+elements with each implementation. The bound alternates between `n` and `n + 1`, making the call
+depend on the iteration. Every element of `Array.range n` satisfies both bounds, so this measures
+full scans with a cheap predicate, not early failures or expensive checks.
+
+One local comparison on Apple M4 Pro, with 64 elements and 1,000,000 calls per implementation,
+gave these ranges over three runs per toolchain (Release compilation, `-O3 -DNDEBUG`):
+
+| Lean | Core instance, ns/call | Custom instance, ns/call |
+| --- | ---: | ---: |
+| v4.32.0 | 496–512 | 56–59 |
+| v4.34.0 | 498–515 | 57–58 |
+| v4.35.0 | 64–84 | 56–57 |
+
+The large gap has disappeared on v4.35, although a smaller difference remains. These measurements
+do not isolate the cause of that remaining difference or predict whole-model-checker speedups. -/
 
 def benchCore (xs : Array Nat) (iters : Nat) : IO Nat := do
   let mut acc := 0
@@ -187,6 +169,7 @@ def main (args : List String) : IO Unit := do
   let n := (args[0]? >>= String.toNat?).getD 64
   let iters := (args[1]? >>= String.toNat?).getD 1000000
   let xs := Array.range n
+  IO.println s!"Lean {Lean.versionString}"
   IO.println s!"∀ i : Fin {n}, xs[i] < bound, decided {iters} times with each instance"
   let t0 ← IO.monoNanosNow
   let a ← benchCore xs iters
@@ -195,6 +178,38 @@ def main (args : List String) : IO Unit := do
   let t2 ← IO.monoNanosNow
   let report (label : String) (ns : Nat) :=
     IO.println s!"  {label}: {ns / 1000000} ms, {ns / iters} ns per call"
-  report "core instance (predicate as a closure)   " (t1 - t0)
-  report "macro_inline instance, specialized loop  " (t2 - t1)
+  report "core instance               " (t1 - t0)
+  report "custom macro_inline instance" (t2 - t1)
   IO.println s!"  same answers: {a == b} ({a} of {iters} calls were true)"
+
+/-! ## 6. Revisit the diagnosis, then the workaround
+
+Lean v4.35 changed `Decidable` from a `class inductive` to a structure containing a `Bool` and a
+proof that it reflects the proposition (Lean PR #8309, also described in the
+[v4.35 release notes](https://lean-lang.org/doc/reference/latest/releases/v4.35.0/)). Reading
+`decide` is now a field projection. The compiler can expand this class dictionary access before
+specialization (`Lean/Compiler/LCNF/Simp/InlineProj.lean`), exposing the check to the loop.
+
+Recompile the unchanged `allBelowCore` on v4.35: instead of the closure and generic call in
+section 1, it calls a specialized `Nat.allLTTR.loop._at_.allBelowCore.spec_0`. Inside that loop
+are the operations we wanted all along (with generated variable names shortened):
+
+    let value : tobj := Array.getInternalBorrowed ◾ xs i ◾;
+    let result : u8 := Nat.decLt value bound;
+
+The loop now performs the check directly. Even `WithInlineInstance.allBelow`, the failed attempt
+on the older toolchains, now gets a specialized loop. Inspect the loop body and its calls:
+`_redArg` alone is not a sign of missed specialization, since specialized functions can have that
+suffix too.
+
+For this example on the tested v4.35 toolchain, the custom instance is no longer needed to compile
+the check directly into the loop. Whether to retire it depends on the remaining benefit and the
+cost of maintaining it. In Veil, the instances in `Veil/Util/DecidableQuantifiers.lean` and the
+`Enumeration`-based instances in `Veil/Frontend/DSL/State/Types.lean` are candidates for that
+review; this example only checks a universal quantifier over `Fin`. Other quantifiers and
+enumeration paths need their own generated-code checks and representative measurements.
+
+The workaround addressed a specific limitation of the compiler we were using. When upgrading
+Lean, revisit both the measurement and the generated code. Keep enough evidence to recognize
+when a workaround can be retired.
+-/
