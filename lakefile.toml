@@ -17,3 +17,7 @@ root = "ExpOpt.QuantifierLoops"
 [[lean_exe]]
 name = "scalar-fingerprints"
 root = "ExpOpt.ScalarFingerprints"
+
+[[lean_exe]]
+name = "shared-reads"
+root = "ExpOpt.SharedReads"
